@@ -18,14 +18,14 @@ package raft
 //
 
 import (
-//	"bytes"
+	//	"bytes"
 	"sync"
 	"sync/atomic"
+	"time"
 
-//	"6.824/labgob"
+	//	"6.824/labgob"
 	"6.824/labrpc"
 )
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -42,6 +42,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For 2D:
 	SnapshotValid bool
@@ -70,10 +71,11 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.term, rf.role == Leader
 }
 
 //
@@ -91,7 +93,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -115,7 +116,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
@@ -136,13 +136,18 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
+
+// 选举时需要传递自己拥有的最后一条log的term和index
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -151,6 +156,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -158,6 +165,42 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer func() {
+		DPrintf("node[%d] role[%v] received vote request from node[%d], now[%d], args: %v, reply: %v", rf.me, rf.role, args.CandidateId, time.Now().UnixMilli(), mr.Any2String(args), mr.Any2String(reply))
+	}()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.Term
+	reply.VoteGranted = false
+	// 不接受小于自己的term的请求
+	if rf.term > args.Term {
+		return
+	}
+
+	if args.Term > rf.term {
+		rf.role = Follower // leader -> follower
+		rf.term = args.Term
+		// 需要比较最新一条日志的情况再决定要不要投票
+		rf.voteFor = RoleNone
+		rf.leaderId = RoleNone
+		rf.persist()
+	}
+
+	// 避免重复投票
+	if rf.voteFor == RoleNone || rf.voteFor == args.CandidateId {
+		lastLogTerm, lastLogIndex := rf.lastLogTermAndLastLogIndex()
+		// 最后一条日志任期更大或者任期一样但是更长
+		if args.LastLogTerm > lastLogTerm || (lastLogTerm == args.LastLogTerm && lastLogIndex <= args.LastLogIndex) {
+			rf.role = Follower
+			rf.voteFor = args.CandidateId
+			rf.leaderId = args.CandidateId
+			rf.lastActiveTime = time.Now()
+			rf.timeoutInterval = randElectionTimeout()
+			reply.VoteGranted = true
+			rf.persist()
+		}
+	}
 }
 
 //
@@ -194,7 +237,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -215,7 +257,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -264,21 +305,55 @@ func (rf *Raft) ticker() {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
+
+// 初始化raft, 所有raft的任务都要另起协程, 测试文件采用的是协程模拟rpc
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
+
+	rf := &Raft{
+		mu:        sync.Mutex{},
+		peers:     peers,
+		persister: persister,
+		me:        me,
+		dead:      -1,
+		nPeers:    len(peers),
+
+		leaderId:          RoleNone,
+		term:              None,
+		voteFor:           RoleNone,
+		role:              Follower,
+		lastActiveTime:    time.Now(),
+		lastHeartBeatTime: time.Now(),
+		timeoutInterval:   randElectionTimeout(),
+		commitIndex:       None,
+		lastApplied:       None,
+		applyChan:         applyCh,
+	}
+	rf.applyCond = sync.NewCond(&rf.mu)
+	DPrintf("starting new raft node, id[%d], lastActiveTime[%v], timeoutInterval[%d]", me, rf.lastActiveTime.UnixMilli(), rf.timeoutInterval.Milliseconds())
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.logs = make([]*LogEntry, 0)
+	rf.nextIndex = make([]int, rf.nPeers)
+	rf.matchIndex = make([]int, rf.nPeers)
+
+	for i := 0; i < rf.nPeers; i++ {
+		rf.nextIndex[i] = 1
+		rf.matchIndex[i] = 0
+	}
+
+	rf.logs = append(rf.logs, &LogEntry{
+		LogTerm: 0,
+	})
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
-
+	//go rf.ticker()
+	go rf.electionLoop()
+	go rf.heartBeatLoop()
+	go rf.applyLogLoop(applyCh)
 
 	return rf
 }
